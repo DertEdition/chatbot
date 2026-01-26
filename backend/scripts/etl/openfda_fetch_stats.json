@@ -1,0 +1,23 @@
+{
+  "total_canonicals": 87,
+  "matched": 75,
+  "not_matched": 8,
+  "skipped_noise": 4,
+  "output_records": 75,
+  "not_matched_list": [
+    "alverine-simethicone",
+    "ambroxol",
+    "bromhexine",
+    "butamirate",
+    "dexketoprofen",
+    "mebeverine",
+    "metamizole",
+    "thiocolchicoside"
+  ],
+  "skipped_noise_list": [
+    "hydrotalcite",
+    "hyoscine",
+    "ivy-leaf-extract",
+    "methylprednisolone"
+  ]
+}

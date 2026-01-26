@@ -1,9 +1,14 @@
 """
 Medical Chatbot - FastAPI Backend
-Sağlık odaklı chatbot API'si - Groq + Translation Pipeline
-TR → EN → LLM → EN → TR
+
+Health-focused chatbot API using Groq LLM with translation pipeline.
+Pipeline: TR → EN → LLM → EN → TR
+
+This module provides the main FastAPI application for the medical chatbot,
+including chat endpoints, translation services, and medicine name handling.
 """
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -12,7 +17,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# .env dosyasını backend dizininden yükle
+# Load .env file from backend directory
 env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
@@ -25,170 +30,251 @@ from app.medicines import MEDICINE_BRANDS
 from app.medicine_utils import detect_medicines, mask_medicines, unmask_medicines, convert_english_medicines_to_turkish
 from app.domain import check_health_domain_simple
 
-# Groq API ayarları
+# Groq API configuration
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 if not GROQ_API_KEY:
-    print("⚠️  UYARI: GROQ_API_KEY ayarlanmamış! .env dosyasına ekleyin.")
+    print("⚠️  WARNING: GROQ_API_KEY not set! Add it to .env file.")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Translator'lar
+# Translation clients for Turkish-English conversion
 tr_to_en = GoogleTranslator(source='tr', target='en')
 en_to_tr = GoogleTranslator(source='en', target='tr')
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan events"""
+    print("🚀 Medical Chatbot API starting...")
+    yield  # Application runs here
+    print("👋 Shutting down...")
+
+
 app = FastAPI(
     title="Medical Chatbot API",
-    description="Sağlık odaklı bilgilendirme chatbot'u - Groq + Translation + RAG",
-    version="3.0.0"
+    description="Health-focused informational chatbot - Groq + Translation + RAG",
+    version="3.0.0",
+    lifespan=lifespan
 )
 
-# RAG Router'ı dahil et (opsiyonel - RAG kuruluysa)
+# Include RAG router (optional - only if RAG dependencies are installed)
 try:
     from app.rag.router import router as rag_router
     app.include_router(rag_router)
-    print("✅ RAG router yüklendi - /rag/* endpoint'leri aktif")
+    print("✅ RAG router loaded - /rag/* endpoints active")
 except ImportError as e:
-    print(f"⚠️ RAG router yüklenemedi (sentence-transformers/faiss kurulu değil): {e}")
+    print(f"⚠️ RAG router not loaded (sentence-transformers/faiss not installed): {e}")
 
-# CORS ayarları
-# NOT: Prod'da allow_origins'i whitelist'e çevirin veya allow_credentials=False yapın
+# CORS configuration
+# NOTE: In production, change allow_origins to a whitelist
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,  # "*" ile kullanıldığında False olmalı
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
 class Message(BaseModel):
-    role: str  # "user" veya "assistant"
+    """Represents a single message in the chat conversation."""
+    role: str  # "user" or "assistant"
     content: str
-    content_en: Optional[str] = None  # İngilizce versiyon (drift önleme için)
+    content_en: Optional[str] = None  # English version for drift prevention
 
 
 class SymptomContext(BaseModel):
-    """3D modelden gelen yapılandırılmış semptom bilgisi"""
-    region: str  # örn: "left_shin"
-    region_name_tr: str  # örn: "Sol Kaval Kemiği"
-    region_name_en: str  # örn: "Left Shin (Tibia)"
-    symptom: str  # örn: "pain"
-    symptom_name_tr: str  # örn: "Ağrı"
-    symptom_name_en: str  # örn: "Pain"
-    severity_0_10: int
-    onset: str  # örn: "2_3_days"
-    trigger: Optional[str] = None  # örn: "after_running"
-    red_flags: List[str] = Field(default_factory=list)
+    """
+    Structured symptom information from the 3D body model.
+
+    Contains detailed information about the user's symptom selection
+    from the interactive 3D human body interface.
+    """
+    region: str  # e.g., "left_shin"
+    region_name_tr: str  # e.g., "Sol Kaval Kemiği"
+    region_name_en: str  # e.g., "Left Shin (Tibia)"
+    symptom: str  # e.g., "pain"
+    symptom_name_tr: str  # e.g., "Ağrı"
+    symptom_name_en: str  # e.g., "Pain"
+    severity_0_10: int  # Severity scale from 0 to 10
+    onset: str  # e.g., "2_3_days"
+    trigger: Optional[str] = None  # e.g., "after_running"
+    red_flags: List[str] = Field(default_factory=list)  # List of reported red flags
 
 
 class ChatRequest(BaseModel):
+    """
+    Request model for the chat endpoint.
+
+    Attributes:
+        message: The user's message text
+        history: Previous conversation messages for context
+        detailed_response: Whether to return a detailed response format
+        symptom_context: Structured symptom data from 3D body model
+    """
     message: str
     history: List[Message] = Field(default_factory=list)
     detailed_response: bool = False
-    symptom_context: Optional[SymptomContext] = None  # 3D modelden gelen yapısal bilgi
+    symptom_context: Optional[SymptomContext] = None
 
 
 class ChatResponse(BaseModel):
+    """
+    Response model for the chat endpoint.
+
+    Attributes:
+        response: The Turkish response text
+        response_en: English version for drift prevention (stored by frontend)
+        is_emergency: Whether an emergency was detected
+        disclaimer: Medical disclaimer text
+    """
     response: str
-    response_en: Optional[str] = None  # İngilizce versiyon (drift önleme için frontend'in saklaması için)
+    response_en: Optional[str] = None
     is_emergency: bool = False
     disclaimer: str = "⚠️ Bu bilgiler eğitim amaçlıdır, tıbbi tavsiye değildir. Acil durumlarda 112'yi arayın."
 
 def translate_to_english(text: str) -> str:
-    """Türkçe metni İngilizce'ye çevirir (ilaç maskeleri korunur)"""
+    """
+    Translate Turkish text to English.
+
+    Medicine masks (MEDTOK tokens) are preserved during translation.
+
+    Args:
+        text: Turkish text to translate
+
+    Returns:
+        Translated English text, or original text if translation fails
+    """
     try:
         translated = tr_to_en.translate(text)
         print(f"[TR→EN] {text[:50]}... → {translated[:50]}...")
         return translated
     except Exception as e:
-        print(f"[ERROR] Çeviri hatası (TR→EN): {e}")
-        return text  # Hata durumunda orijinal metni döndür
+        print(f"[ERROR] Translation error (TR→EN): {e}")
+        return text
 
 
 def translate_to_turkish(text: str) -> str:
-    """İngilizce metni Türkçe'ye çevirir"""
+    """
+    Translate English text to Turkish.
+
+    Args:
+        text: English text to translate
+
+    Returns:
+        Translated Turkish text, or original text if translation fails
+    """
     try:
         translated = en_to_tr.translate(text)
         print(f"[EN→TR] {text[:50]}... → {translated[:50]}...")
         return translated
     except Exception as e:
-        print(f"[ERROR] Çeviri hatası (EN→TR): {e}")
+        print(f"[ERROR] Translation error (EN→TR): {e}")
         return text
 
 
 def call_groq(messages: list, system_prompt: str = None) -> str:
-    """Groq API'sine istek gönderir (İngilizce)"""
+    """
+    Send a request to the Groq API for chat completion.
+
+    Args:
+        messages: List of message dictionaries with 'role' and 'content' keys
+        system_prompt: Optional system prompt to prepend to messages
+
+    Returns:
+        The LLM response text
+
+    Raises:
+        HTTPException: If the API call fails
+    """
     try:
         groq_messages = []
-        
+
         if system_prompt:
             groq_messages.append({"role": "system", "content": system_prompt})
-        
+
         for msg in messages:
             groq_messages.append({"role": msg["role"], "content": msg["content"]})
-        
-        print(f"[DEBUG] Groq'a istek gönderiliyor, model: {GROQ_MODEL}")
-        
+
+        print(f"[DEBUG] Sending request to Groq, model: {GROQ_MODEL}")
+
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=groq_messages,
             temperature=0.7,
             max_tokens=2048,
         )
-        
+
         result = response.choices[0].message.content
-        print(f"[DEBUG] Groq yanıtı: {result[:100]}...")
+        print(f"[DEBUG] Groq response: {result[:100]}...")
         return result
-        
+
     except Exception as e:
-        print(f"[ERROR] Groq hatası: {str(e)}")
-        raise HTTPException(status_code=503, detail=f"LLM API hatası: {str(e)}")
+        print(f"[ERROR] Groq error: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"LLM API error: {str(e)}")
 
 
 def call_groq_classifier(messages: list, system_prompt: str) -> str:
     """
-    Sınıflandırma için optimize edilmiş Groq çağrısı.
-    - temperature=0 (deterministik)
-    - max_tokens=3 (YES/NO/UNCERTAIN)
-    - stop=["\n"] (tek satır yanıt)
+    Optimized Groq API call for classification tasks.
+
+    Uses deterministic settings for consistent classification:
+    - temperature=0 for deterministic output
+    - max_tokens=3 for YES/NO/UNCERTAIN response
+    - stop=["\\n"] for single-line response
+
+    Args:
+        messages: List of message dictionaries
+        system_prompt: System prompt for classification
+
+    Returns:
+        Classification result: "YES", "NO", or "UNCERTAIN"
     """
     try:
         groq_messages = [{"role": "system", "content": system_prompt}]
-        
+
         for msg in messages:
             groq_messages.append({"role": msg["role"], "content": msg["content"]})
-        
-        print(f"[CLASSIFIER] Groq'a sınıflandırma isteği gönderiliyor")
-        
+
+        print("[CLASSIFIER] Sending classification request to Groq")
+
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=groq_messages,
-            temperature=0,  # Deterministik
-            max_tokens=3,   # Kısa yanıt (YES/NO/UNCERTAIN)
-            stop=["\n"],    # Tek satır
+            temperature=0,
+            max_tokens=3,
+            stop=["\n"],
         )
-        
+
         result = response.choices[0].message.content.strip().upper()
-        print(f"[CLASSIFIER] Sonuç: {result}")
+        print(f"[CLASSIFIER] Result: {result}")
         return result
-        
+
     except Exception as e:
-        print(f"[ERROR] Classifier hatası: {str(e)}")
-        return "UNCERTAIN"  # Hata durumunda belirsiz
+        print(f"[ERROR] Classifier error: {str(e)}")
+        return "UNCERTAIN"
 
 
 
 
 
 def get_english_system_prompt(detailed: bool = False, has_history: bool = False, symptom_context: SymptomContext = None) -> str:
-    """İngilizce sistem prompt'u döndürür - ilk soru vs takip soruları için farklı
-    
-    Eğer symptom_context varsa, 3D modelden gelen yapısal bilgiyi prompt'a ekler.
     """
-    
-    # Yapısal context varsa, prompt'a ekle
+    Generate the English system prompt for the LLM.
+
+    Returns different prompts for initial questions vs follow-up questions.
+    If symptom_context is provided, includes structured data from the 3D body model.
+
+    Args:
+        detailed: Whether to request a detailed response format
+        has_history: Whether this is a follow-up question (has conversation history)
+        symptom_context: Optional structured symptom data from 3D model
+
+    Returns:
+        The system prompt string for the LLM
+    """
     context_section = ""
     if symptom_context:
         context_section = f"""
@@ -281,19 +367,25 @@ async def root():
 
 def has_health_context_in_history(history: list) -> bool:
     """
-    History'de gerçek bir sağlık konusu var mı kontrol eder.
-    Sadece selamlaşma/nasılsın gibi mesajlar varsa False döner.
+    Check if conversation history contains actual health-related topics.
+
+    Returns False if history only contains greetings or casual messages.
+
+    Args:
+        history: List of Message objects from conversation history
+
+    Returns:
+        True if history contains health-related content, False otherwise
     """
     if not history:
         return False
-    
+
     for msg in history:
         if msg.role == "user":
             content = msg.content.lower()
-            # Selamlaşma değilse ve sağlık keyword'ü içeriyorsa
             if not is_greeting(content) and is_health_related(content):
                 return True
-    
+
     return False
 
 
@@ -305,32 +397,46 @@ async def health_check():
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """
-    Ana chat endpoint'i
-    Pipeline: TR Soru → EN Çeviri → Groq LLM → TR Çeviri → Yanıt
+    Main chat endpoint for the medical chatbot.
+
+    Pipeline: TR Question → EN Translation → Groq LLM → TR Translation → Response
+
+    The endpoint handles:
+    - Greeting detection and responses
+    - Emergency symptom detection
+    - Health domain validation
+    - Medicine name masking/unmasking for accurate translation
+    - Context-aware responses based on conversation history
+
+    Args:
+        request: ChatRequest containing message, history, and optional symptom context
+
+    Returns:
+        ChatResponse with Turkish response and optional English version
+
+    Raises:
+        HTTPException: If message is empty or API call fails
     """
     user_message = request.message.strip()
-    
+
     if not user_message:
-        raise HTTPException(status_code=400, detail="Mesaj boş olamaz")
-    
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
     has_history = len(request.history) > 0
-    # Sağlık konulu bir geçmiş var mı? (merhaba/nasılsın değil, gerçek sağlık sorusu)
     has_health_context = has_health_context_in_history(request.history)
-    
-    # Symptom context var mı? (3D modelden gelen yapısal bilgi)
     has_symptom_context = request.symptom_context is not None
-    
-    # 1. Selamlaşma kontrolü (Türkçe)
-    # SADECE symptom_context YOKSA ve sağlık bağlamı YOKSA selamlaşma yanıtı ver
+
+    # Step 1: Greeting check (Turkish)
+    # Only respond with greeting if no symptom context and no health context
     greeting_type = get_greeting_type(user_message)
     if greeting_type and not has_health_context and not has_symptom_context:
         return ChatResponse(
             response=get_greeting_response(greeting_type),
             is_emergency=False
         )
-    
-    # 2. Acil durum kontrolü (Türkçe + Yapısal context)
-    # Red flag'leri kontrol et (yapısal context'ten)
+
+    # Step 2: Emergency check (Turkish + Structured context)
+    # Check red flags from structured context
     if request.symptom_context and request.symptom_context.red_flags:
         critical_flags = ['loss_of_consciousness', 'difficulty_breathing', 'chest_pain', 'severe_bleeding']
         if any(flag in critical_flags for flag in request.symptom_context.red_flags):
@@ -347,35 +453,35 @@ async def chat(request: ChatRequest):
             is_emergency=True,
             disclaimer="🚨 ACİL DURUM - Hemen 112'yi arayın!"
         )
-    
-    # 3. Sağlık domain kontrolü
-    # Eğer symptom_context varsa, otomatik olarak sağlık konusu kabul et
-    # - İlk sağlık sorusu: tam sağlık kontrolü yap
-    # - Follow-up'larda: sadece açıkça alakasız konuları reddet (kara delik, yemek tarifi vs.)
-    #   "gelip geçici", "evet", "3 gündür" gibi kısa cevaplar kabul edilir
+
+    # Step 3: Health domain validation
+    # If symptom_context exists, automatically accept as health topic
+    # - Initial health question: perform full health check
+    # - Follow-ups: only reject clearly unrelated topics 
+    #   Short answers like "yes", "3 days" are accepted
     has_symptom_context = request.symptom_context is not None
-    
+
     if not is_greeting(user_message) and not has_symptom_context:
         if has_health_context:
-            # Follow-up: sadece açıkça sağlık dışı konu değişikliğini reddet
-            # Ama önce sağlık sinyali var mı kontrol et (örn: "dizim ağrıyor ama futbol")
+            # Follow-up: only reject clear non-health topic changes
+            # First check if there's any health signal
             health_kw, health_pat, _, _ = count_health_signals(user_message)
             hard_nh, soft_nh, _, _ = count_non_health_signals(user_message)
-            
-            # Sağlık sinyali varsa geçir
+
+            # If health signal exists, continue
             if health_kw + health_pat > 0:
-                pass  # Devam et
-            # Follow-up'ta sadece HARD konu değişimini reddet
+                pass
+            # In follow-up, only reject HARD topic changes
             elif hard_nh > 0:
                 return ChatResponse(
                     response="Anladım, konu değiştirmek istiyorsunuz. 😊\n\nAncak ben sadece sağlık konularında yardımcı olabiliyorum. Eğer sağlıkla ilgili başka bir sorunuz varsa, sormaktan çekinmeyin!\n\nÖnceki konuya devam etmek isterseniz de yanınızdayım.",
                     is_emergency=False
                 )
-            # Soft non-health (fiyat/ne kadar/futbol) gördüysen bile follow-up'ta direkt reddetme
+            # Soft non-health signals - don't reject in follow-up
             else:
-                pass  # Devam et
+                pass
         else:
-            # İlk sağlık sorusu (veya sadece selamlaşma geçmişi var): tam sağlık kontrolü
+            # Initial health question (or only greeting history): full health check
             domain_result = check_health_domain_simple(user_message)
             
             if domain_result == "NO":
@@ -384,88 +490,93 @@ async def chat(request: ChatRequest):
                     is_emergency=False
                 )
             elif domain_result == "UNCERTAIN":
-                # Belirsiz durumda netleştirme sorusu sor
                 return ChatResponse(
                     response="Merhaba! 😊 Mesajınızı tam anlayamadım.\n\nBen sağlık konularında yardımcı olan bir asistanım. Sağlık, semptom veya ilaçlarla ilgili bir sorunuz mu var?\n\nLütfen sorunuzu biraz daha açıklayabilir misiniz?",
                     is_emergency=False
                 )
-    
-    # 4. Pipeline: TR → MASK → EN → LLM → TR → UNMASK → EN→TR
-    # İlaç isimlerini maskele, çevir, LLM'den yanıt al, çevir, maskeleri aç, EN ilaçları TR'ye çevir
 
-    # Global mask_map ve counter (history + current message için tek map)
+    # Step 4: Translation Pipeline
+    # TR → MASK → EN → LLM → TR → UNMASK → EN→TR
+    # Mask medicine names, translate, get LLM response, translate back, unmask
+
+    # Global mask map and counter (single map for history + current message)
     global_mask_map = {}
     mask_counter = 0
 
-    # 4a. Geçmiş mesajları işle (history'den başla, counter collision önleme)
+    # Step 4a: Process history messages (start from history, prevent counter collision)
     messages_en = []
     for msg in request.history[-10:]:
         if msg.content_en:
-            # Frontend'den gelen İngilizce versiyon var, direkt kullan (drift önleme)
+            # Use English version from frontend (drift prevention)
             content_en = msg.content_en
         elif msg.role == "user":
-            # User mesajı, maskele ve çevir (counter devam ettir)
+            # User message: mask and translate (continue counter)
             masked_hist, global_mask_map, mask_counter = mask_medicines(
                 msg.content, start_counter=mask_counter, existing_mask_map=global_mask_map
             )
             content_en = translate_to_english(masked_hist)
         else:
-            # Assistant mesajı ve content_en yok, çevir (eski mesajlar için backward compat)
+            # Assistant message without content_en: translate (backward compatibility)
             content_en = translate_to_english(msg.content)
 
         messages_en.append({"role": msg.role, "content": content_en})
 
-    # 4b. Kullanıcı mesajındaki ilaçları maskele (counter kaldığı yerden devam)
+    # Step 4b: Mask medicines in user message (continue counter from history)
     masked_message, global_mask_map, mask_counter = mask_medicines(
         user_message, start_counter=mask_counter, existing_mask_map=global_mask_map
     )
     print(f"[MASK-MAP] {global_mask_map}")
 
-    # 4c. Maskelenmiş mesajı İngilizce'ye çevir
+    # Step 4c: Translate masked message to English
     user_message_en = translate_to_english(masked_message)
 
-    # Kullanıcı mesajını ekle
     messages_en.append({"role": "user", "content": user_message_en})
 
-    # 4d. İngilizce sistem prompt'u al (yapısal context ile)
-    # has_health_context: True ise follow-up (kısa), False ise ilk sağlık sorusu (detaylı)
+    # Step 4d: Get English system prompt (with structural context)
+    # has_health_context: True = follow-up (concise), False = initial question (detailed)
     system_prompt_en = get_english_system_prompt(
         detailed=request.detailed_response,
         has_history=has_health_context,
         symptom_context=request.symptom_context
     )
 
-    # 4e. Groq'tan İngilizce yanıt al
+    # Step 4e: Get English response from Groq
     response_en_raw = call_groq(messages_en, system_prompt=system_prompt_en)
 
-    # 4f. Yanıtı Türkçe'ye çevir
+    # Step 4f: Translate response to Turkish
     response_tr = translate_to_turkish(response_en_raw)
 
-    # 4g. ÖNCE LLM'in kendi eklediği İngilizce ilaç isimlerini Türkçe'ye çevir
-    # (mask ile yakalanmayan "ibuprofen", "acetaminophen" gibi)
-    # NOT: Bu unmask'ten ÖNCE yapılmalı, yoksa çift dönüşüm olur
+    # Step 4g: Convert LLM-generated English medicine names to Turkish
+    # (names not caught by mask like "ibuprofen", "acetaminophen")
+    # NOTE: This must happen BEFORE unmask to avoid double conversion
     response_tr = convert_english_medicines_to_turkish(response_tr, format_style="tr_with_en")
 
-    # 4h. SONRA maskeleri aç: MEDTOK0 → "Parol (paracetamol)"
+    # Step 4h: Unmask medicine tokens: MEDTOK0 → "Parol (paracetamol)"
     if global_mask_map:
         response_tr = unmask_medicines(response_tr, global_mask_map, format_style="tr_with_en")
-        # response_en için en_only kullan (drift önleme - saf İngilizce kalmalı)
+        # For response_en, use en_only (drift prevention - keep pure English)
         response_en_raw = unmask_medicines(response_en_raw, global_mask_map, format_style="en_only")
 
     return ChatResponse(
         response=response_tr,
-        response_en=response_en_raw,  # Saf İngilizce (drift önleme için)
+        response_en=response_en_raw,
         is_emergency=False
     )
 
 
 @app.get("/models")
 async def list_models():
+    """
+    List available LLM models and current configuration.
+
+    Returns:
+        Dictionary with current model, available models, provider, and pipeline info
+    """
     return {
         "current_model": GROQ_MODEL,
         "available_models": [
             "llama-3.3-70b-versatile",
-            "llama-3.1-70b-versatile", 
+            "llama-3.1-70b-versatile",
             "mixtral-8x7b-32768"
         ],
         "provider": "Groq",
