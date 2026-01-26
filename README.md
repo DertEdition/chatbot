@@ -149,4 +149,4 @@ Bu proje eğitim amaçlıdır. Tıbbi tavsiye niteliği taşımaz.
 
 ---
 
-**Uyarı**: Bu chatbot tıbbi teşhis veya tedavi sağlamaz. Acil durumlarda 112'yi arayın.
+⚠️ **Uyarı:** Bu uygulama sadece bilgilendirme amaçlıdır. Tıbbi tavsiye yerine geçmez. Acil durumlarda **112**'yi arayın!
