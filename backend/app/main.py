@@ -34,10 +34,25 @@ from app.domain import check_health_domain_simple
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-if not GROQ_API_KEY:
-    print("⚠️  WARNING: GROQ_API_KEY not set! Add it to .env file.")
+# Local model configuration
+USE_LOCAL_MODEL = os.getenv("USE_LOCAL_MODEL", "false").lower() == "true"
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+# Colab fine-tuned model configuration
+USE_COLAB_MODEL = os.getenv("USE_COLAB_MODEL", "false").lower() == "true"
+COLAB_API_URL = os.getenv("COLAB_API_URL", "")
+
+if USE_COLAB_MODEL and COLAB_API_URL:
+    print(f"🧪 COLAB MODEL MODE - Fine-tuned Llama 3.1 8B")
+    print(f"   URL: {COLAB_API_URL}")
+    groq_client = None
+elif USE_LOCAL_MODEL:
+    print("🏠 LOCAL MODEL MODE - Fine-tuned Qwen2.5-3B")
+    groq_client = None
+else:
+    if not GROQ_API_KEY:
+        print("⚠️  WARNING: GROQ_API_KEY not set! Add it to .env file.")
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    print(f"☁️  GROQ API MODE - Model: {GROQ_MODEL}")
 
 # Translation clients for Turkish-English conversion
 tr_to_en = GoogleTranslator(source='tr', target='en')
@@ -66,6 +81,14 @@ try:
     print("✅ RAG router loaded - /rag/* endpoints active")
 except ImportError as e:
     print(f"⚠️ RAG router not loaded (sentence-transformers/faiss not installed): {e}")
+
+# Include Vision router (drug image analysis)
+try:
+    from app.vision_router import router as vision_router
+    app.include_router(vision_router)
+    print("✅ Vision router loaded - /vision/* endpoints active")
+except ImportError as e:
+    print(f"⚠️ Vision router not loaded: {e}")
 
 # CORS configuration
 # NOTE: In production, change allow_origins to a whitelist
@@ -129,11 +152,13 @@ class ChatResponse(BaseModel):
         response_en: English version for drift prevention (stored by frontend)
         is_emergency: Whether an emergency was detected
         disclaimer: Medical disclaimer text
+        model_provider: Which model generated the response
     """
     response: str
     response_en: Optional[str] = None
     is_emergency: bool = False
     disclaimer: str = "⚠️ Bu bilgiler eğitim amaçlıdır, tıbbi tavsiye değildir. Acil durumlarda 112'yi arayın."
+    model_provider: Optional[str] = None
 
 def translate_to_english(text: str) -> str:
     """
@@ -175,9 +200,353 @@ def translate_to_turkish(text: str) -> str:
         return text
 
 
-def call_groq(messages: list, system_prompt: str = None) -> str:
+def get_rag_context_for_colab(question: str) -> str:
     """
-    Send a request to the Groq API for chat completion.
+    RAG knowledge base'den fine-tuned model için bağlam al.
+    RAG yüklü değilse veya hata olursa boş string döner.
+    """
+    try:
+        from app.rag.knowledge_base import get_knowledge_base
+        kb = get_knowledge_base()
+        if kb is None:
+            return ""
+
+        results = kb.search(query=question, top_k=3)
+        if not results:
+            return ""
+
+        # En iyi 3 sonucu context olarak formatla
+        context_parts = []
+        for i, doc in enumerate(results[:3], 1):
+            title = doc.get("metadata", {}).get("title", "")
+            text = doc.get("text", "")
+            if text:
+                # Çok uzun textleri kısalt
+                if len(text) > 500:
+                    text = text[:500] + "..."
+                context_parts.append(f"[Source {i}: {title}]\n{text}")
+
+        context = "\n---\n".join(context_parts)
+        print(f"[RAG→COLAB] Found {len(results)} results, using top {len(context_parts)}")
+        return context
+
+    except Exception as e:
+        print(f"[RAG→COLAB] RAG not available: {e}")
+        return ""
+
+
+def build_enriched_prompt(question: str, rag_context: str = "") -> str:
+    """
+    Prompt Engineering: 8B model için basit ve etkili prompt.
+    Karmaşık talimatlar yerine RAG bilgisini doğrudan soruya ekle.
+    """
+    # RAG bilgisini soruya doğal şekilde entegre et
+    if rag_context:
+        return (
+            f"Based on the following medical information:\n{rag_context}\n\n"
+            f"Answer this question: {question}"
+        )
+    else:
+        return question
+
+
+def post_process_response(text: str) -> str:
+    """
+    Agresif post-processing: Fine-tuned model çıktısını temizle.
+    Sıralama önemli: ÖNCE kes, SONRA temizle.
+    """
+    import re
+
+    if not text:
+        return text
+
+    # === STEP 1: İlk disclaimer'da kes (EN ÖNEMLİ) ===
+    # Model: iyi cevap → disclaimer → saçmalama. İlk disclaimer'da kesiyoruz.
+    cut_patterns = [
+        r'\*This is general health information[^*]*\*',
+        r'\*Always seek immediate attention[^*]*\*',
+        r'\*Consult a healthcare professional[^*]*\*',
+        r'\*If symptoms persist[^*]*\*',
+        r'\*Never delay seeking help[^*]*\*',
+        r'\*Disclaimer:[^*]*\*',
+        r'\*This information is for educational[^*]*\*',
+    ]
+    for pattern in cut_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            text = text[:match.end()]
+            break
+
+    # === STEP 2: Stop phrase'lerde kes ===
+    stop_phrases = [
+        "Is there anything else I can help you with",
+        "Do you have any other questions",
+        "Feel free to ask",
+        "I hope this helps",
+        "Let me know if you",
+        "If you have any further",
+        "Please don't hesitate",
+    ]
+    for phrase in stop_phrases:
+        idx = text.lower().find(phrase.lower())
+        if idx > 0:
+            end = idx + len(phrase)
+            for i in range(end, min(end + 50, len(text))):
+                if text[i] in '.?!\n':
+                    end = i + 1
+                    break
+            text = text[:end]
+            break
+
+    # === STEP 3: Kalan disclaimer'ları kaldır (artık sadece tek disclaimer kaldı) ===
+    disclaimer_patterns = [
+        r'\*Disclaimer:.*?\*',
+        r'\*This information is for educational.*?\*',
+        r'\*This is general health information.*?\*',
+        r'\*Please consult a healthcare professional.*?\*',
+        r'\*Always consult.*?advice\.?\*',
+        r'\*Always seek immediate attention.*?\*',
+        r'\*Never delay seeking help.*?\*',
+        r'\*If this is an emergency.*?\*',
+        r'\*Consult your doctor.*?\*',
+        r'\*This is not medical advice.*?\*',
+        r'\*Do not rely on this.*?\*',
+        r'\*If symptoms persist.*?\*',
+        r'\*Please do not self-diagnose.*?\*',
+        r'\*Note:.*?professional.*?\*',
+        r'Disclaimer:.*?(?:\n|$)',
+    ]
+    for pattern in disclaimer_patterns:
+        text = re.sub(pattern, '', text, flags=re.DOTALL | re.IGNORECASE)
+
+    # === STEP 4: Tekrarlayan satırları kaldır ===
+    lines = text.split('\n')
+    seen = set()
+    deduped = []
+    empty_count = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            empty_count += 1
+            if empty_count <= 2:
+                deduped.append(line)
+            continue
+        empty_count = 0
+        normalized = re.sub(r'\s+', ' ', stripped.lower())
+        if len(normalized) > 15 and normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(line)
+    text = '\n'.join(deduped)
+
+    # === STEP 5: Uzunluk limiti ===
+    if len(text) > 2000:
+        last_para = text[:2000].rfind('\n\n')
+        if last_para > 500:
+            text = text[:last_para]
+
+    # === STEP 6: Final temizlik ===
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = text.strip()
+
+    return text
+
+
+def call_colab_model(messages: list, system_prompt: str = None) -> str:
+    """
+    Send a request to the Colab-hosted fine-tuned model via Gradio 5.x API.
+    Enhanced with: Prompt Engineering + RAG Context + Post-processing.
+
+    Args:
+        messages: List of message dictionaries with 'role' and 'content' keys
+        system_prompt: Optional system prompt
+
+    Returns:
+        The model response text
+
+    Raises:
+        HTTPException: If the API call fails
+    """
+    import requests as http_requests
+    import json
+
+    try:
+        question = messages[-1]["content"] if messages else ""
+
+        print(f"[COLAB] Sending question to {COLAB_API_URL}")
+
+        is_modal = "modal.run" in COLAB_API_URL
+
+        if is_modal:
+            # Modal endpoint: simple JSON API
+            r = http_requests.post(
+                COLAB_API_URL,
+                json={"message": question, "max_tokens": 512, "temperature": 0.7},
+                timeout=300,
+                allow_redirects=True,
+            )
+
+            if r.status_code != 200:
+                raise HTTPException(status_code=503, detail=f"Modal model error: {r.status_code}")
+
+            data = r.json()
+            result = data.get("response", "")
+        else:
+            # Gradio endpoint (Colab): async SSE API
+            r = http_requests.post(
+                f"{COLAB_API_URL}/gradio_api/call/chat",
+                json={"data": [question, [], "You are a helpful medical assistant. Provide clear, structured health information. For emergencies, advise calling 112. Recommend professional consultation when appropriate.", 512, 0.7]},
+                timeout=30
+            )
+
+            if r.status_code != 200:
+                raise HTTPException(status_code=503, detail="Colab model unavailable")
+
+            event_id = r.json().get("event_id")
+
+            r2 = http_requests.get(
+                f"{COLAB_API_URL}/gradio_api/call/chat/{event_id}",
+                timeout=300,
+                stream=True
+            )
+
+            result = ""
+            for line in r2.iter_lines():
+                if line:
+                    decoded = line.decode()
+                    if decoded.startswith("data: "):
+                        data = decoded[6:]
+                        if data != "null":
+                            parsed = json.loads(data)
+                            if isinstance(parsed, list) and len(parsed) >= 2:
+                                history = parsed[1]
+                                if history and isinstance(history, list) and history[-1]:
+                                    result = history[-1][1] if history[-1][1] else ""
+                            elif isinstance(parsed, list) and parsed:
+                                result = parsed[0] if parsed[0] else ""
+
+        # === 3. Post-processing (temizle, düzenle) ===
+        result = post_process_response(result)
+        print(f"[COLAB] Response: {result[:100]}...")
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Colab model error: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Colab model error: {str(e)}")
+
+
+def is_quality_response(text: str) -> bool:
+    """
+    Check if a model response has enough meaningful content.
+    Returns False if the response is too short, empty, or mostly filler.
+    """
+    if not text or len(text.strip()) < 80:
+        return False
+
+    # Check if it's mostly generic "consult a doctor" with no real content
+    generic_phrases = [
+        "consult a healthcare", "see a doctor", "seek medical",
+        "consult your doctor", "medical professional",
+        "we cannot provide", "i cannot provide", "not a licensed",
+        "general advice", "general health information",
+    ]
+    lower = text.lower()
+    generic_count = sum(1 for p in generic_phrases if p in lower)
+    # If more than half the sentences are generic disclaimers, it's bad
+    sentence_count = max(1, lower.count('.') + lower.count('?') + lower.count('!'))
+    if generic_count >= sentence_count * 0.5 and sentence_count < 5:
+        return False
+
+    return True
+
+
+def _call_groq_api(messages: list, system_prompt: str = None) -> str:
+    """Direct Groq API call (no routing logic)."""
+    groq_messages = []
+    if system_prompt:
+        groq_messages.append({"role": "system", "content": system_prompt})
+    for msg in messages:
+        groq_messages.append({"role": msg["role"], "content": msg["content"]})
+
+    print(f"[GROQ] Sending request, model: {GROQ_MODEL}")
+    response = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=groq_messages,
+        temperature=0.7,
+        max_tokens=2048,
+    )
+    result = response.choices[0].message.content
+    print(f"[GROQ] Response: {result[:100]}...")
+    return result
+
+
+def call_groq(messages: list, system_prompt: str = None) -> tuple:
+    """
+    Send a request to the LLM (Groq API, Local Model, or Colab).
+
+    Smart fallback: If Colab model produces a low-quality response,
+    automatically falls back to Groq+RAG for reliable output.
+
+    Args:
+        messages: List of message dictionaries with 'role' and 'content' keys
+        system_prompt: Optional system prompt to prepend to messages
+
+    Returns:
+        Tuple of (response_text, provider_name)
+
+    Raises:
+        HTTPException: If the API call fails
+    """
+    # Use Colab fine-tuned model if configured (with Groq fallback)
+    if USE_COLAB_MODEL and COLAB_API_URL:
+        try:
+            result = call_colab_model(messages, system_prompt)
+            if is_quality_response(result):
+                return result, "colab-finetuned (Llama-3.1-8B + LoRA)"
+            else:
+                print(f"[FALLBACK] Colab response too short/low quality ({len(result)} chars), falling back to Groq")
+        except Exception as e:
+            print(f"[FALLBACK] Colab model failed: {e}, falling back to Groq")
+
+        # Fallback to Groq
+        if groq_client is None:
+            # Initialize Groq client for fallback (wasn't created at startup because Colab was primary)
+            from groq import Groq as GroqClient
+            fallback_client = GroqClient(api_key=GROQ_API_KEY)
+            groq_messages = []
+            if system_prompt:
+                groq_messages.append({"role": "system", "content": system_prompt})
+            for msg in messages:
+                groq_messages.append({"role": msg["role"], "content": msg["content"]})
+            print(f"[FALLBACK] Using Groq API (fallback), model: {GROQ_MODEL}")
+            response = fallback_client.chat.completions.create(
+                model=GROQ_MODEL, messages=groq_messages, temperature=0.7, max_tokens=2048
+            )
+            result = response.choices[0].message.content
+            return result, f"groq-fallback ({GROQ_MODEL})"
+        else:
+            result = _call_groq_api(messages, system_prompt)
+            return result, f"groq-fallback ({GROQ_MODEL})"
+
+    # Use local model if configured
+    if USE_LOCAL_MODEL:
+        result = call_local_model(messages, system_prompt)
+        return result, "local-finetuned (Qwen2.5-3B + LoRA)"
+
+    # Use Groq API (primary)
+    try:
+        result = _call_groq_api(messages, system_prompt)
+        return result, f"groq ({GROQ_MODEL})"
+    except Exception as e:
+        print(f"[ERROR] Groq error: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"LLM API error: {str(e)}")
+
+
+def call_local_model(messages: list, system_prompt: str = None) -> str:
+    """
+    Send a request to the local fine-tuned model.
 
     Args:
         messages: List of message dictionaries with 'role' and 'content' keys
@@ -187,33 +556,26 @@ def call_groq(messages: list, system_prompt: str = None) -> str:
         The LLM response text
 
     Raises:
-        HTTPException: If the API call fails
+        HTTPException: If model inference fails
     """
     try:
-        groq_messages = []
+        from app.local_model import generate_response
 
-        if system_prompt:
-            groq_messages.append({"role": "system", "content": system_prompt})
+        print(f"[DEBUG] Using local fine-tuned model")
 
-        for msg in messages:
-            groq_messages.append({"role": msg["role"], "content": msg["content"]})
-
-        print(f"[DEBUG] Sending request to Groq, model: {GROQ_MODEL}")
-
-        response = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=groq_messages,
+        result = generate_response(
+            messages=messages,
+            system_prompt=system_prompt,
+            max_new_tokens=1024,
             temperature=0.7,
-            max_tokens=2048,
         )
 
-        result = response.choices[0].message.content
-        print(f"[DEBUG] Groq response: {result[:100]}...")
+        print(f"[DEBUG] Local model response: {result[:100]}...")
         return result
 
     except Exception as e:
-        print(f"[ERROR] Groq error: {str(e)}")
-        raise HTTPException(status_code=503, detail=f"LLM API error: {str(e)}")
+        print(f"[ERROR] Local model error: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Local model error: {str(e)}")
 
 
 def call_groq_classifier(messages: list, system_prompt: str) -> str:
@@ -540,8 +902,8 @@ async def chat(request: ChatRequest):
         symptom_context=request.symptom_context
     )
 
-    # Step 4e: Get English response from Groq
-    response_en_raw = call_groq(messages_en, system_prompt=system_prompt_en)
+    # Step 4e: Get English response from LLM
+    response_en_raw, model_provider = call_groq(messages_en, system_prompt=system_prompt_en)
 
     # Step 4f: Translate response to Turkish
     response_tr = translate_to_turkish(response_en_raw)
@@ -560,7 +922,8 @@ async def chat(request: ChatRequest):
     return ChatResponse(
         response=response_tr,
         response_en=response_en_raw,
-        is_emergency=False
+        is_emergency=False,
+        model_provider=model_provider
     )
 
 
@@ -572,16 +935,35 @@ async def list_models():
     Returns:
         Dictionary with current model, available models, provider, and pipeline info
     """
-    return {
-        "current_model": GROQ_MODEL,
-        "available_models": [
-            "llama-3.3-70b-versatile",
-            "llama-3.1-70b-versatile",
-            "mixtral-8x7b-32768"
-        ],
-        "provider": "Groq",
-        "pipeline": "TR → EN → LLM → TR"
-    }
+    if USE_COLAB_MODEL and COLAB_API_URL:
+        return {
+            "current_model": "Llama-3.1-8B-Instruct + LoRA",
+            "mode": "colab",
+            "adapter": "bilgehantekin/medical-llama-3.1-8b-adapter",
+            "provider": "Google Colab (Fine-tuned)",
+            "pipeline": "TR → EN → LLM → TR",
+            "colab_url": COLAB_API_URL
+        }
+    elif USE_LOCAL_MODEL:
+        return {
+            "current_model": "Qwen2.5-3B-Instruct + LoRA",
+            "mode": "local",
+            "adapter": "checkpoint-1000 (fine-tuned)",
+            "provider": "Local (Fine-tuned)",
+            "pipeline": "TR → EN → LLM → TR"
+        }
+    else:
+        return {
+            "current_model": GROQ_MODEL,
+            "mode": "cloud",
+            "available_models": [
+                "llama-3.3-70b-versatile",
+                "llama-3.1-70b-versatile",
+                "mixtral-8x7b-32768"
+            ],
+            "provider": "Groq",
+            "pipeline": "TR → EN → LLM → TR"
+        }
 
 
 if __name__ == "__main__":

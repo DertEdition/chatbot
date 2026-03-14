@@ -1,0 +1,16 @@
+{
+  "normalized": true,
+  "version": "3.0",
+  "dimension": 384,
+  "model": "all-MiniLM-L6-v2",
+  "total_documents": 1298,
+  "index_type": "ivf",
+  "nprobe": 10,
+  "categories": [
+    "emergency",
+    "medications",
+    "diseases",
+    "symptoms",
+    "mental_health"
+  ]
+}
