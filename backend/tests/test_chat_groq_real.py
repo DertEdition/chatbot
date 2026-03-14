@@ -42,6 +42,19 @@ def client():
     return TestClient(app)
 
 
+def retry_on_503(client_post_func, payload, max_retries=3):
+    """Helper: Retry on 503 (rate limit) with exponential backoff"""
+    for attempt in range(max_retries):
+        response = client_post_func("/chat", json=payload)
+        if response.status_code != 503:
+            return response
+        if attempt < max_retries - 1:
+            wait_time = 5 * (2 ** attempt)  # 5s, 10s, 20s
+            print(f"  ⏳ Got 503, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+            time.sleep(wait_time)
+    return response  # Return last response even if 503
+
+
 # ============================================================================
 # TC-CHAT-01: Health query with REAL Groq response
 # ============================================================================
@@ -50,13 +63,10 @@ def test_tc_chat_01_real_groq(client):
     Health-related query returns meaningful Groq response
     Validates: Domain check + Translation + Groq API + Response quality
     """
-    response = client.post(
-        "/chat",
-        json={
-            "message": "Başım 3 gündür ağrıyor, ne yapmalıyım?",
-            "history": []
-        }
-    )
+    response = retry_on_503(client.post, {
+        "message": "Başım 3 gündür ağrıyor, ne yapmalıyım?",
+        "history": []
+    })
     
     assert response.status_code == 200
     data = response.json()
@@ -74,6 +84,7 @@ def test_tc_chat_01_real_groq(client):
     
     print(f"\n✅ TC-CHAT-01 (REAL) - Response quality: {len(answer)} chars")
     print(f"   Sample: {answer[:150]}...")
+    time.sleep(3)  # Rate limit: 30 req/min = 2s minimum, add buffer
 
 
 # ============================================================================
@@ -84,13 +95,10 @@ def test_tc_chat_04_real_groq(client):
     Emergency scenario returns emergency guidance + meaningful Groq response
     Validates: Emergency detection + Groq API + Combined response
     """
-    response = client.post(
-        "/chat",
-        json={
-            "message": "Göğsümde şiddetli ağrı var ve nefes almakta çok zorluk çekiyorum",
-            "history": []
-        }
-    )
+    response = retry_on_503(client.post, {
+        "message": "Göğsümde şiddetli ağrı var ve nefes almakta çok zorluk çekiyorum",
+        "history": []
+    })
     
     assert response.status_code == 200
     data = response.json()
@@ -104,6 +112,7 @@ def test_tc_chat_04_real_groq(client):
     
     print(f"\n✅ TC-CHAT-04 (REAL) - Emergency detected correctly")
     print(f"   Response includes: {data['response'][:100]}...")
+    time.sleep(3)
 
 
 # ============================================================================
@@ -114,13 +123,10 @@ def test_tc_chat_05_real_groq(client):
     Medicine name detected and Groq provides relevant response
     Validates: Medicine detection + Groq API + Meaningful answer
     """
-    response = client.post(
-        "/chat",
-        json={
-            "message": "Paracetamol kullandım ama baş ağrısı geçmedi",
-            "history": []
-        }
-    )
+    response = retry_on_503(client.post, {
+        "message": "Paracetamol kullandım ama baş ağrısı geçmedi",
+        "history": []
+    })
     
     assert response.status_code == 200
     data = response.json()
@@ -132,6 +138,7 @@ def test_tc_chat_05_real_groq(client):
     
     print(f"\n✅ TC-CHAT-05 (REAL) - Medicine context handled")
     print(f"   Response: {answer[:150]}...")
+    time.sleep(3)
 
 
 # ============================================================================
@@ -142,13 +149,10 @@ def test_tc_chat_08_real_groq(client):
     Medicine information query returns Groq response
     (RAG may not be available, but Groq should still respond)
     """
-    response = client.post(
-        "/chat",
-        json={
-            "message": "Paracetamol ne işe yarar?",
-            "history": []
-        }
-    )
+    response = retry_on_503(client.post, {
+        "message": "Parasetamol nasıl kullanılır?",
+        "history": []
+    })
     
     # Could be 200 or 503 (if RAG unavailable)
     assert response.status_code in [200, 503]
@@ -161,6 +165,8 @@ def test_tc_chat_08_real_groq(client):
         print(f"\n✅ TC-CHAT-08 (REAL) - Groq answered: {answer[:100]}...")
     else:
         print(f"\n⚠️  TC-CHAT-08 (REAL) - RAG unavailable (503), skipping detail check")
+    
+    time.sleep(3)
 
 
 # ============================================================================
@@ -171,13 +177,10 @@ def test_tc_chat_12_real_groq(client):
     Gender context preserved through TR->EN->TR pipeline
     Validates: Translation pipeline + Context preservation
     """
-    response = client.post(
-        "/chat",
-        json={
-            "message": "Ben kadınım ve boğazım ağrıyor, ne yapmalıyım?",
-            "history": []
-        }
-    )
+    response = retry_on_503(client.post, {
+        "message": "Ben kadınım ve boğazım ağrıyor, ne yapmalıyım?",
+        "history": []
+    })
     
     assert response.status_code == 200
     data = response.json()
@@ -188,6 +191,7 @@ def test_tc_chat_12_real_groq(client):
     assert "boğaz" in answer.lower() or "ağrı" in answer.lower()
     
     print(f"\n✅ TC-CHAT-12 (REAL) - Pronouns handled: {answer[:100]}...")
+    time.sleep(3)
 
 
 # ============================================================================
@@ -199,13 +203,10 @@ def test_tc_chat_14_real_groq(client):
     Includes: Translation, Groq API call, Response processing
     """
     start = time.time()
-    response = client.post(
-        "/chat",
-        json={
-            "message": "Başım ağrıyor",
-            "history": []
-        }
-    )
+    response = retry_on_503(client.post, {
+        "message": "Başım ağrıyor, ne yapmalıyım?",
+        "history": []
+    })
     elapsed = time.time() - start
     
     assert response.status_code == 200
@@ -217,6 +218,7 @@ def test_tc_chat_14_real_groq(client):
     
     # Groq should respond within 30s (timeout limit)
     assert elapsed < 30, f"Response took {elapsed:.2f}s, max allowed: 30s"
+    time.sleep(3)
 
 
 # ============================================================================
@@ -226,13 +228,10 @@ def test_tc_chat_15_real_groq(client):
     """
     Verify real Groq response is readable and artifact-free
     """
-    response = client.post(
-        "/chat",
-        json={
-            "message": "Başağrısı için ne yapmalıyım?",
-            "history": []
-        }
-    )
+    response = retry_on_503(client.post, {
+        "message": "Başağrısı için ne yapmalıyım?",
+        "history": []
+    })
     
     assert response.status_code == 200
     data = response.json()
@@ -248,6 +247,7 @@ def test_tc_chat_15_real_groq(client):
     print(f"\n✅ TC-CHAT-15 (REAL) - Readability check passed")
     print(f"   Response length: {len(answer)} chars, {answer.count(chr(10))} lines")
     print(f"   Sample: {answer[:100]}...")
+    time.sleep(3)  # Final test rate limit delay
 
 
 if __name__ == "__main__":
