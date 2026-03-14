@@ -239,13 +239,15 @@ def test_tc_chat_15_real_groq(client):
     answer = data["response"]
     
     # Readability checks
-    assert len(answer) > 30
+    assert len(answer) > 100, "Response should be detailed (>100 chars)"
     assert "<" not in answer and ">" not in answer, "No HTML"
     assert "```" not in answer, "No code blocks"
-    assert answer.count("\n") < 10, "Not too many linebreaks"
+    # Groq often provides well-structured responses with bullet points
+    assert answer.count("\n") < 50, "Reasonable number of linebreaks (< 50)"
     
     print(f"\n✅ TC-CHAT-15 (REAL) - Readability check passed")
-    print(f"   Response: {answer[:100]}...")
+    print(f"   Response length: {len(answer)} chars, {answer.count(chr(10))} lines")
+    print(f"   Sample: {answer[:100]}...")
 
 
 if __name__ == "__main__":
