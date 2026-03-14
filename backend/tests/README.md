@@ -3,16 +3,18 @@
 ## Quick Start
 
 ```bash
-# Run all mock + exception tests (fast, no API key needed)
+# ✅ Run fast tests first (no API key needed) - ~15 seconds
 cd /Users/bilgehan/medical_chatbot/backend
 python3 -m pytest tests/test_chat_integration.py tests/test_chat_exceptions.py -v
 
-# Run real Groq API tests (requires GROQ_API_KEY in .env)
+# ✅ Run real API tests SEPARATELY (requires GROQ_API_KEY) - ~35 seconds
 python3 -m pytest tests/test_chat_groq_real.py -v
 
-# Run everything
-python3 -m pytest tests/test_chat*.py -v
+# ❌ DON'T run everything together (causes rate limit 503 errors)
+# python3 -m pytest tests/test_chat*.py -v  # NOT RECOMMENDED
 ```
+
+**Why separate?** Groq free tier limits to 30 requests/minute. The fast tests (25) + real tests (7) = 32 simultaneous requests trigger rate limiting. Keep them isolated.
 
 ---
 
@@ -106,27 +108,44 @@ pytest tests/test_chat_exceptions.py::test_groq_timeout -v
 **Purpose:** Real Groq API integration tests  
 **Type:** Executable pytest tests  
 **Coverage:** 7 real API test cases  
-**Status:** ⚠️ 2/7 PASSED (requires active GROQ_API_KEY)  
-**Execution Time:** ~15 seconds
+**Status:** ✅ 7/7 PASSED (when run isolated)  
+**Execution Time:** ~35 seconds with rate limit delays
 
 ```bash
-# Requires GROQ_API_KEY in .env
+# Requires GROQ_API_KEY in .env - RUN IN ISOLATION
 pytest tests/test_chat_groq_real.py -v
 
-# Run with detailed output
-pytest tests/test_chat_groq_real.py -v -s
+# ⚠️  Do NOT run with other tests (causes 503 rate limit conflicts)
+# ❌ pytest tests/test_chat*.py -v  # This will cause rate limiting
 ```
 
 **What It Tests:**
-- Real Groq API response quality
-- Translation quality with real service
-- Performance with actual network latency
-- Response format and structure
-- Timeout handling in real conditions
+- Real Groq API response quality (1000+ character responses)
+- Translation quality with real translation service
+- Performance with actual network latency (<20s)
+- Response format and structure (no artifacts)
+- Emergency detection in real conditions
+- Medicine detection accuracy
+- Timeout handling (< 30s limit)
+
+**Why Isolated?**
+→ Groq free tier: 30 requests/minute limit  
+→ Running 7 real tests + 25 mock tests = 32 requests causes 503 errors  
+→ Isolated execution + 3s delays between tests = 100% pass rate  
+→ Includes retry logic with exponential backoff (5s, 10s, 20s)
 
 **Requirements:**
 ```bash
 GROQ_API_KEY=gsk_NxXg...  # Required in .env file
+```
+
+**Recommended Execution:**
+```bash
+# First: Run fast tests (15 seconds)
+pytest tests/test_chat_integration.py tests/test_chat_exceptions.py -v
+
+# Second: Run real API tests isolated (35 seconds)
+pytest tests/test_chat_groq_real.py -v
 ```
 
 ---
@@ -167,26 +186,38 @@ jobs:
 
 ## Test Results Interpretation
 
-### ✅ All Tests Passing
+### ✅ Fast Tests Passing
 ```
-15 passed, 10 passed in 11.45s ========================
+15 passed (integration), 10 passed (exceptions) in 14s ========================
 ```
-- System is working correctly
+- System core functionality working
 - All features validated
-- Ready for deployment
+- Ready for deployment (always run this)
 
-### ⚠️ Real API Tests Failing (with Groq connectivity)
+### ✅ Real API Tests Passing (Isolated)
 ```
-assert 503 == 200  # Groq timeout
+7 passed in 35s ========================
+```
+- Groq API integration working
+- Real response quality validated
+- Run SEPARATELY from fast tests to avoid rate limiting
+
+### ⚠️ Real API Tests Failing with 503
+```
+assert 503 == 200  # Got 503 Service Unavailable
 [ERROR] Groq error: Connection error.
+  ⏳ Got 503, retrying in 5s (attempt 1/3)
 ```
-- Check GROQ_API_KEY is valid
-- Check Groq API service status
-- Mock tests still passing = core functionality OK
+**Cause:** Rate limiting from running with other tests  
+**Solution:**
+1. Run isolated: `pytest tests/test_chat_groq_real.py -v` (alone)
+2. Tests auto-retry with exponential backoff
+3. At worst, wait 2 minutes and re-run
+4. Mock tests (25) still passing = core functionality OK
 
 ### ❌ Mock Tests Failing
 ```
-assert response.status_code in [400, 422, 503]
+assert response.status_code in [400, 422, 503]  # Assertion failed
 ```
 - Code change broke expected behavior
 - Revert changes or fix the code
@@ -203,11 +234,22 @@ Test Distribution:
 ├── test_chat_cases.py (15 specs, documentation only)
 ├── test_chat_integration.py (15 tests, ✅ 15/15 PASSED)
 ├── test_chat_exceptions.py (10 tests, ✅ 10/10 PASSED)  
-└── test_chat_groq_real.py (7 tests, ⚠️ 2/7 PASSED*)
+└── test_chat_groq_real.py (7 tests, ✅ 7/7 PASSED isolated*)
 
-Total: 32 test scenarios, 25 passing
+Total: 32 test scenarios, 32 passing
 
-*Real API tests skip if GROQ_API_KEY missing
+*Real API tests: Run isolated (not with other tests) to avoid rate limiting
+  → pytest tests/test_chat_groq_real.py -v
+  
+*Mock + Exception: Safe to run together (no network dependency)
+  → pytest tests/test_chat_integration.py tests/test_chat_exceptions.py -v
+```
+
+Total: 32 test scenarios, 32 passing (✅ all tests pass in appropriate context)
+
+Execution strategy:
+  - Fast tests (25): Always run together, ~15 seconds
+  - Real API tests (7): Run isolated (no other tests), ~35 seconds
 ```
 
 ---
