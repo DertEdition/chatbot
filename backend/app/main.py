@@ -902,6 +902,22 @@ async def chat(request: ChatRequest):
         symptom_context=request.symptom_context
     )
 
+    # Step 4d-extra: Add medicine context to system prompt so LLM knows what MEDTOK tokens mean
+    if global_mask_map:
+        medicine_notes = []
+        for mask_key, names in global_mask_map.items():
+            medicine_notes.append(f'{mask_key} = {names["en"]} (Turkish brand: {names["tr"]})')
+        medicine_context = "\n".join(medicine_notes)
+        system_prompt_en += f"""
+
+=== MEDICINE TOKEN MAPPING ===
+The user's message contains medicine name tokens. Here is what they mean:
+{medicine_context}
+
+IMPORTANT: When you see these tokens in the user's message, treat them as the actual medicine names listed above. Respond about those medicines directly. Do NOT say you don't recognize the token.
+In your response, use the SAME token (e.g. MEDTOK0X) instead of the generic name. Do NOT write the generic name separately.
+==============================="""
+
     # Step 4e: Get English response from LLM
     response_en_raw, model_provider = call_groq(messages_en, system_prompt=system_prompt_en)
 
@@ -910,12 +926,22 @@ async def chat(request: ChatRequest):
 
     # Step 4g: Convert LLM-generated English medicine names to Turkish
     # (names not caught by mask like "ibuprofen", "acetaminophen")
-    # NOTE: This must happen BEFORE unmask to avoid double conversion
-    response_tr = convert_english_medicines_to_turkish(response_tr, format_style="tr_with_en")
+    # Skip generic names already in mask_map to avoid duplication (e.g. "Parasetamol" + "Parol")
+    masked_generics = {names["en"].lower() for names in global_mask_map.values()} if global_mask_map else set()
+    if masked_generics:
+        # Temporarily remove masked generic names from conversion to avoid duplicates
+        import app.medicine_utils as mu
+        orig_dict = mu.ENGLISH_TO_TURKISH_MEDICINES
+        filtered_dict = {k: v for k, v in orig_dict.items() if k.lower() not in masked_generics}
+        mu.ENGLISH_TO_TURKISH_MEDICINES = filtered_dict
+        response_tr = convert_english_medicines_to_turkish(response_tr, format_style="tr_only")
+        mu.ENGLISH_TO_TURKISH_MEDICINES = orig_dict
+    else:
+        response_tr = convert_english_medicines_to_turkish(response_tr, format_style="tr_only")
 
-    # Step 4h: Unmask medicine tokens: MEDTOK0 → "Parol (paracetamol)"
+    # Step 4h: Unmask medicine tokens: MEDTOK0 → "Parol"
     if global_mask_map:
-        response_tr = unmask_medicines(response_tr, global_mask_map, format_style="tr_with_en")
+        response_tr = unmask_medicines(response_tr, global_mask_map, format_style="tr_only")
         # For response_en, use en_only (drift prevention - keep pure English)
         response_en_raw = unmask_medicines(response_en_raw, global_mask_map, format_style="en_only")
 

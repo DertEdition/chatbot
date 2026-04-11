@@ -454,7 +454,7 @@ def unmask_medicines(text: str, mask_map: dict, format_style: str = "tr_with_en"
             en_short = en_short.split("/")[0].strip()  # Slash öncesi
             replacement = f"{tr_name} ({en_short})"
         elif format_style == "tr_only":
-            replacement = tr_name
+            replacement = tr_name.title()
         elif format_style == "en_only":
             replacement = en_name
         else:
